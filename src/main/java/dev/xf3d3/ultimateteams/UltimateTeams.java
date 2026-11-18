@@ -316,14 +316,27 @@ public final class UltimateTeams extends JavaPlugin implements TaskRunner, GsonU
         sendConsole("&6UltimateTeams: &3Plugin by: &b&lxF3d3");
         sendConsole("&6UltimateTeams: &3Contributors: &b&ldei0 (TeamEnderChest)");
 
-        // Shutdown backup manager
+        // Stop periodic backups and persist the final backup snapshot.
         if (backupManager != null) {
             backupManager.shutdown();
         }
 
-        // Cancel plugin tasks and close the database connection
+        // Close cross-server integrations before releasing plugin resources.
+        if (broker != null) {
+            try {
+                broker.close();
+            } catch (RuntimeException exception) {
+                getLogger().log(Level.WARNING, "Failed to close the cross-server broker cleanly.", exception);
+            } finally {
+                broker = null;
+            }
+        }
+
+        // Cancel scheduled work and close the database connection if startup reached it.
         getScheduler().cancelAllTasks();
-        database.close();
+        if (database != null) {
+            database.close();
+        }
 
         // Final plugin shutdown message
         sendConsole("&6UltimateTeams: &3Plugin Version: &d&l" + pluginVersion);
