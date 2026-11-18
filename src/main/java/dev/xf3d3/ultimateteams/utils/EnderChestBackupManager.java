@@ -129,8 +129,9 @@ public class EnderChestBackupManager {
     public void backupAllChests() {
         List<Team> teamSnapshot = new ArrayList<>(plugin.getTeamStorageUtil().getTeams());
         for (Team team : teamSnapshot) {
-            for (int chestNumber = 1; chestNumber <= team.getEnderChestCount(); chestNumber++) {
-                team.getEnderChest(chestNumber).ifPresent(chest -> backupChest(team.getId(), chest));
+            List<TeamEnderChest> chestSnapshot = new ArrayList<>(team.getEnderChests().values());
+            for (TeamEnderChest chest : chestSnapshot) {
+                backupChest(team.getId(), chest);
             }
         }
     }
@@ -148,15 +149,11 @@ public class EnderChestBackupManager {
         }
 
         Team team = teamOptional.get();
-        int count = 0;
-        for (int chestNumber = 1; chestNumber <= team.getEnderChestCount(); chestNumber++) {
-            Optional<TeamEnderChest> chest = team.getEnderChest(chestNumber);
-            if (chest.isPresent()) {
-                backupChest(team.getId(), chest.get());
-                count++;
-            }
+        List<TeamEnderChest> chestSnapshot = new ArrayList<>(team.getEnderChests().values());
+        for (TeamEnderChest chest : chestSnapshot) {
+            backupChest(team.getId(), chest);
         }
-        return count;
+        return chestSnapshot.size();
     }
 
     /**
@@ -275,12 +272,14 @@ public class EnderChestBackupManager {
      * the previous backup file. A partial write will not truncate the last good file.
      */
     public void saveBackups() {
-        Map<String, List<TeamEnderChestBackup>> snapshot = new LinkedHashMap<>();
-        synchronized (backupsLock) {
-            backups.forEach((key, value) -> snapshot.put(key, new ArrayList<>(value)));
-        }
-
         synchronized (saveLock) {
+            // Take the snapshot after acquiring the write lock so an older
+            // snapshot cannot overwrite a newer save that finished first.
+            Map<String, List<TeamEnderChestBackup>> snapshot = new LinkedHashMap<>();
+            synchronized (backupsLock) {
+                backups.forEach((key, value) -> snapshot.put(key, new ArrayList<>(value)));
+            }
+
             Path temporaryPath = backupsPath.resolveSibling(backupsPath.getFileName() + ".tmp");
             try {
                 Files.createDirectories(backupsPath.getParent());
