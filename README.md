@@ -4,7 +4,14 @@
 
 <br>&nbsp;<br>
 
-UltimateTeams is a light-weight teams plugin for Minecraft servers running Spigot and most of its forks, with cross-server support, developed with optimization in mind!
+UltimateTeams is a light-weight teams plugin for Minecraft servers running Paper 26.3 and compatible forks, with cross-server support, developed with optimization in mind!
+
+## Compatibility
+
+- Current Cottage★ build: UltimateTeams 5.2.0.
+- Target server: Paper 26.3 or a compatible fork.
+- Runtime: Java 25.
+- Folia support is declared in the plugin metadata; test the specific integrations enabled by your configuration before production use.
 
 UltimateTeams does offer the ability to disable friendly fire within your team and allies!
 
