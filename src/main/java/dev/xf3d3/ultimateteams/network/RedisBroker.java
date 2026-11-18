@@ -67,17 +67,29 @@ public class RedisBroker extends PluginMessageBroker {
 
                 try {
                     Message message = plugin.getMessageFromJson(encodedMessage);
-                    if (message.getTargetType() == Message.TargetType.PLAYER) {
-                        Bukkit.getOnlinePlayers().stream()
-                                .filter(player -> player.getName().equalsIgnoreCase(message.getTarget()))
-                                .findFirst()
-                                .ifPresent(receiver -> handle(receiver, message));
-                        return;
-                    }
+                    // Redis invokes this callback on its subscriber thread. Marshal
+                    // Bukkit/player access and broker dispatch onto the server scheduler.
+                    plugin.runSync(task -> {
+                        if (closing.get()) {
+                            return;
+                        }
 
-                    handle(plugin.getUsersStorageUtil().getOnlineUsers().stream().findAny().orElse(null), message);
+                        try {
+                            if (message.getTargetType() == Message.TargetType.PLAYER) {
+                                Bukkit.getOnlinePlayers().stream()
+                                        .filter(player -> player.getName().equalsIgnoreCase(message.getTarget()))
+                                        .findFirst()
+                                        .ifPresent(receiver -> handle(receiver, message));
+                                return;
+                            }
+
+                            handle(plugin.getUsersStorageUtil().getOnlineUsers().stream().findAny().orElse(null), message);
+                        } catch (RuntimeException exception) {
+                            plugin.getLogger().log(Level.WARNING, "Could not process a Redis team message on the server scheduler.", exception);
+                        }
+                    });
                 } catch (RuntimeException exception) {
-                    plugin.getLogger().log(Level.WARNING, "Ignoring an invalid or unprocessable Redis team message.", exception);
+                    plugin.getLogger().log(Level.WARNING, "Ignoring an invalid Redis team message.", exception);
                 }
             }
         };
