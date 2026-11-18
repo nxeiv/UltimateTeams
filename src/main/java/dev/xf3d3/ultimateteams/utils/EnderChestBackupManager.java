@@ -10,297 +10,304 @@ import dev.xf3d3.ultimateteams.models.TeamEnderChest;
 import dev.xf3d3.ultimateteams.models.TeamEnderChestBackup;
 import org.jetbrains.annotations.NotNull;
 
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.reflect.Type;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.logging.Level;
 
 /**
- * Manages automatic backups of team ender chests
+ * Manages automatic backups of team ender chests.
  */
 public class EnderChestBackupManager {
-    
-    private final UltimateTeams plugin;
-    private final File backupsFile;
-    private final Gson gson;
-    private final Map<String, List<TeamEnderChestBackup>> backups; // Key: "teamId-chestNumber"
-    private volatile WrappedTask backupTask;
-    private volatile boolean running = true;
-    
+    private static final long INITIAL_RETRY_TICKS = 20L;
     private static final int BACKUP_INTERVAL_MINUTES = 30;
-    private static final long BACKUP_INTERVAL_TICKS = BACKUP_INTERVAL_MINUTES * 60 * 20; // 30 minutes in ticks
-    private static final int MAX_BACKUPS_PER_CHEST = 10; // Keep last 10 backups (5 hours worth)
-    
+    private static final long BACKUP_INTERVAL_TICKS = BACKUP_INTERVAL_MINUTES * 60L * 20L;
+    private static final int MAX_BACKUPS_PER_CHEST = 10;
+
+    private final UltimateTeams plugin;
+    private final Path backupsPath;
+    private final Gson gson;
+    private final Map<String, List<TeamEnderChestBackup>> backups = new HashMap<>();
+    private final Object backupsLock = new Object();
+    private final Object saveLock = new Object();
+
+    private volatile WrappedTask scheduledTask;
+    private volatile boolean running = true;
+
     public EnderChestBackupManager(@NotNull UltimateTeams plugin) {
         this.plugin = plugin;
-        this.backupsFile = new File(plugin.getDataFolder(), "echest_backups.json");
+        this.backupsPath = plugin.getDataFolder().toPath().resolve("echest_backups.json");
         this.gson = new GsonBuilder()
                 .excludeFieldsWithoutExposeAnnotation()
                 .setPrettyPrinting()
                 .create();
-        this.backups = new ConcurrentHashMap<>();
-        
+
         loadBackups();
         startAutoBackup();
     }
-    
-    /**
-     * Start the automatic backup task
-     */
+
     private void startAutoBackup() {
         running = true;
-        if (backupTask != null) {
-            backupTask.cancel();
-        }
-        
-        // Schedule the first backup immediately
-        scheduleNextBackup();
+        // Team data is loaded asynchronously during plugin startup. Do not
+        // create the first backup until TeamsStorage has finished loading.
+        scheduleNextBackup(INITIAL_RETRY_TICKS);
     }
-    
-    /**
-     * Schedule the next backup task
-     */
-    private void scheduleNextBackup() {
+
+    private void scheduleNextBackup(long delayTicks) {
         if (!running) {
             return;
         }
-        
-        // Schedule the backup task asynchronously
-        plugin.runAsync(task -> {
-            // Store task reference for cancellation
-            backupTask = task;
-            
-            // Double-check running flag after task starts
+
+        scheduledTask = plugin.getScheduler().runLater(() -> {
+            scheduledTask = null;
             if (!running) {
                 return;
             }
-            
-            try {
-                if (plugin.getSettings().getGeneral().isEchestBackupLog()) plugin.getLogger().info("Creating automatic ender chest backups...");
 
-                backupAllChests();
-                saveBackups();
-
-                if (plugin.getSettings().getGeneral().isEchestBackupLog()) plugin.getLogger().info("Automatic ender chest backups completed.");
-            } catch (Exception e) {
-                plugin.getLogger().log(java.util.logging.Level.SEVERE, 
-                    "Error during automatic ender chest backup: {0}", e.getMessage());
-                plugin.getLogger().log(java.util.logging.Level.SEVERE, 
-                    "Stack trace:", e);
+            if (!plugin.isLoaded()) {
+                scheduleNextBackup(INITIAL_RETRY_TICKS);
+                return;
             }
-            
-            // Schedule the next backup after the interval (only if still running)
-            if (running) {
-                // Use runLater to schedule the next backup on the main thread, then call scheduleNextBackup
-                // This ensures proper thread context and prevents stack overflow
-                plugin.getScheduler().runLater(() -> {
-                    if (running) {
-                        scheduleNextBackup();
+
+            plugin.runAsync(task -> {
+                if (!running) {
+                    return;
+                }
+
+                try {
+                    if (plugin.getSettings().getGeneral().isEchestBackupLog()) {
+                        plugin.getLogger().info("Creating automatic ender chest backups...");
                     }
-                }, BACKUP_INTERVAL_TICKS);
-            }
-        });
+
+                    backupAllChests();
+                    saveBackups();
+
+                    if (plugin.getSettings().getGeneral().isEchestBackupLog()) {
+                        plugin.getLogger().info("Automatic ender chest backups completed.");
+                    }
+                } catch (Exception exception) {
+                    plugin.getLogger().log(Level.SEVERE, "Error during automatic ender chest backup.", exception);
+                } finally {
+                    if (running) {
+                        scheduleNextBackup(BACKUP_INTERVAL_TICKS);
+                    }
+                }
+            });
+        }, delayTicks);
     }
-    
+
     /**
-     * Stop the automatic backup task
+     * Stop future backups and persist the last completed snapshot.
      */
     public void shutdown() {
         running = false;
-        if (backupTask != null) {
-            backupTask.cancel();
-            backupTask = null;
+
+        WrappedTask task = scheduledTask;
+        scheduledTask = null;
+        if (task != null) {
+            task.cancel();
         }
+
         saveBackups();
     }
-    
+
     /**
-     * Backup all team ender chests
+     * Back up every team's ender chests.
      */
     public void backupAllChests() {
-        for (Team team : plugin.getTeamStorageUtil().getTeams()) {
+        List<Team> teamSnapshot = new ArrayList<>(plugin.getTeamStorageUtil().getTeams());
+        for (Team team : teamSnapshot) {
             for (int chestNumber = 1; chestNumber <= team.getEnderChestCount(); chestNumber++) {
-                team.getEnderChest(chestNumber).ifPresent(chest -> 
-                    backupChest(team.getId(), chest)
-                );
+                team.getEnderChest(chestNumber).ifPresent(chest -> backupChest(team.getId(), chest));
             }
         }
     }
-    
+
     /**
-     * Backup all chests for a specific team
-     * @param teamId The team ID
-     * @return Number of chests backed up
+     * Back up all chests for a specific team.
+     *
+     * @param teamId the team ID
+     * @return number of chests backed up
      */
     public int backupTeamChests(int teamId) {
+        Optional<Team> teamOptional = plugin.getTeamStorageUtil().findTeam(teamId);
+        if (teamOptional.isEmpty()) {
+            return 0;
+        }
+
+        Team team = teamOptional.get();
         int count = 0;
-        Optional<Team> teamOpt = plugin.getTeamStorageUtil().findTeam(teamId);
-        if (teamOpt.isPresent()) {
-            Team team = teamOpt.get();
-            for (int chestNumber = 1; chestNumber <= team.getEnderChestCount(); chestNumber++) {
-                team.getEnderChest(chestNumber).ifPresent(chest -> {
-                    backupChest(team.getId(), chest);
-                });
+        for (int chestNumber = 1; chestNumber <= team.getEnderChestCount(); chestNumber++) {
+            Optional<TeamEnderChest> chest = team.getEnderChest(chestNumber);
+            if (chest.isPresent()) {
+                backupChest(team.getId(), chest.get());
                 count++;
             }
         }
         return count;
     }
-    
+
     /**
-     * Backup a specific chest
-     * @param teamId The team ID
-     * @param chest The chest to backup
+     * Back up one ender chest.
      */
     public void backupChest(int teamId, @NotNull TeamEnderChest chest) {
         String key = getKey(teamId, chest.getChestNumber());
         TeamEnderChestBackup backup = TeamEnderChestBackup.fromChest(teamId, chest);
-        
-        List<TeamEnderChestBackup> chestBackups = backups.computeIfAbsent(key, k -> new ArrayList<>());
-        chestBackups.add(backup);
-        
-        // Keep only the last MAX_BACKUPS_PER_CHEST backups
-        if (chestBackups.size() > MAX_BACKUPS_PER_CHEST) {
+
+        synchronized (backupsLock) {
+            List<TeamEnderChestBackup> chestBackups = backups.computeIfAbsent(key, ignored -> new ArrayList<>());
+            chestBackups.add(backup);
             chestBackups.sort(Comparator.comparingLong(TeamEnderChestBackup::getTimestamp));
-            chestBackups.subList(0, chestBackups.size() - MAX_BACKUPS_PER_CHEST).clear();
+
+            if (chestBackups.size() > MAX_BACKUPS_PER_CHEST) {
+                chestBackups.subList(0, chestBackups.size() - MAX_BACKUPS_PER_CHEST).clear();
+            }
         }
     }
-    
+
     /**
-     * Get all backups for a specific chest
-     * @param teamId The team ID
-     * @param chestNumber The chest number
-     * @return List of backups, sorted by timestamp (newest first)
+     * Get all backups for a chest, newest first.
      */
     @NotNull
     public List<TeamEnderChestBackup> getBackups(int teamId, int chestNumber) {
-        String key = getKey(teamId, chestNumber);
-        List<TeamEnderChestBackup> chestBackups = backups.getOrDefault(key, new ArrayList<>());
-        chestBackups.sort(Comparator.comparingLong(TeamEnderChestBackup::getTimestamp).reversed());
-        return new ArrayList<>(chestBackups);
+        List<TeamEnderChestBackup> result;
+        synchronized (backupsLock) {
+            result = new ArrayList<>(backups.getOrDefault(getKey(teamId, chestNumber), List.of()));
+        }
+        result.sort(Comparator.comparingLong(TeamEnderChestBackup::getTimestamp).reversed());
+        return result;
     }
-    
+
     /**
-     * Get a specific backup by index (0 = newest, 1 = second newest, etc.)
-     * @param teamId The team ID
-     * @param chestNumber The chest number
-     * @param index The backup index (0-based)
-     * @return Optional containing the backup if found
+     * Get a backup by index (zero is the newest).
      */
     @NotNull
     public Optional<TeamEnderChestBackup> getBackup(int teamId, int chestNumber, int index) {
         List<TeamEnderChestBackup> chestBackups = getBackups(teamId, chestNumber);
-        if (index >= 0 && index < chestBackups.size()) {
-            return Optional.of(chestBackups.get(index));
-        }
-        return Optional.empty();
+        return index >= 0 && index < chestBackups.size()
+                ? Optional.of(chestBackups.get(index))
+                : Optional.empty();
     }
-    
+
     /**
-     * Restore a chest from a backup
-     * @param teamId The team ID
-     * @param chestNumber The chest number
-     * @param backupIndex The backup index (0 = newest)
-     * @return true if restore was successful
+     * Restore a chest from a backup.
      */
     public boolean restoreBackup(int teamId, int chestNumber, int backupIndex) {
-        Optional<Team> teamOpt = plugin.getTeamStorageUtil().findTeam(teamId);
-        if (teamOpt.isEmpty()) {
+        Optional<Team> teamOptional = plugin.getTeamStorageUtil().findTeam(teamId);
+        if (teamOptional.isEmpty()) {
             return false;
         }
-        
-        Team team = teamOpt.get();
-        Optional<TeamEnderChest> chestOpt = team.getEnderChest(chestNumber);
-        if (chestOpt.isEmpty()) {
+
+        Team team = teamOptional.get();
+        Optional<TeamEnderChest> chestOptional = team.getEnderChest(chestNumber);
+        Optional<TeamEnderChestBackup> backupOptional = getBackup(teamId, chestNumber, backupIndex);
+        if (chestOptional.isEmpty() || backupOptional.isEmpty()) {
             return false;
         }
-        
-        Optional<TeamEnderChestBackup> backupOpt = getBackup(teamId, chestNumber, backupIndex);
-        if (backupOpt.isEmpty()) {
-            return false;
-        }
-        
-        TeamEnderChestBackup backup = backupOpt.get();
-        TeamEnderChest chest = chestOpt.get();
-        
-        // Restore the contents
+
+        TeamEnderChest chest = chestOptional.get();
+        TeamEnderChestBackup backup = backupOptional.get();
         chest.setSerializedContents(backup.getSerializedContents());
         chest.setRows(backup.getRows());
-        
-        // Save to database
         plugin.getDatabase().updateTeam(team);
-        
         return true;
     }
-    
-    /**
-     * Delete all backups for a specific chest
-     * @param teamId The team ID
-     * @param chestNumber The chest number
-     */
+
     public void deleteBackups(int teamId, int chestNumber) {
-        String key = getKey(teamId, chestNumber);
-        backups.remove(key);
+        synchronized (backupsLock) {
+            backups.remove(getKey(teamId, chestNumber));
+        }
         saveBackups();
     }
-    
-    /**
-     * Delete all backups for a team
-     * @param teamId The team ID
-     */
+
     public void deleteTeamBackups(int teamId) {
-        backups.keySet().removeIf(key -> key.startsWith(teamId + "-"));
+        String prefix = teamId + "-";
+        synchronized (backupsLock) {
+            backups.keySet().removeIf(key -> key.startsWith(prefix));
+        }
         saveBackups();
     }
-    
-    /**
-     * Get the key for a chest backup
-     */
+
     private String getKey(int teamId, int chestNumber) {
         return teamId + "-" + chestNumber;
     }
-    
-    /**
-     * Load backups from file
-     */
+
     private void loadBackups() {
-        if (!backupsFile.exists()) {
+        if (!Files.exists(backupsPath)) {
             return;
         }
-        
-        try (FileReader reader = new FileReader(backupsFile)) {
-            Type type = new TypeToken<Map<String, List<TeamEnderChestBackup>>>(){}.getType();
+
+        Type type = new TypeToken<Map<String, List<TeamEnderChestBackup>>>() { }.getType();
+        try (var reader = Files.newBufferedReader(backupsPath, StandardCharsets.UTF_8)) {
             Map<String, List<TeamEnderChestBackup>> loaded = gson.fromJson(reader, type);
-            if (loaded != null) {
-                backups.putAll(loaded);
-                plugin.getLogger().log(java.util.logging.Level.INFO, 
-                    "Loaded {0} ender chest backup entries.", backups.size());
+            if (loaded == null) {
+                return;
             }
-        } catch (IOException e) {
-            plugin.getLogger().log(java.util.logging.Level.SEVERE, 
-                "Failed to load ender chest backups: {0}", e.getMessage());
+
+            synchronized (backupsLock) {
+                loaded.forEach((key, value) -> {
+                    if (key != null && value != null) {
+                        backups.put(key, new ArrayList<>(value));
+                    }
+                });
+            }
+
+            plugin.getLogger().log(Level.INFO, "Loaded {0} ender chest backup entries.", loaded.size());
+        } catch (Exception exception) {
+            plugin.getLogger().log(Level.SEVERE, "Failed to load ender chest backups. The original file was left untouched.", exception);
         }
     }
-    
+
     /**
-     * Save backups to file
+     * Save a consistent snapshot by writing a temporary file and then replacing
+     * the previous backup file. A partial write will not truncate the last good file.
      */
     public void saveBackups() {
-        try {
-            if (!backupsFile.exists()) {
-                backupsFile.getParentFile().mkdirs();
-                backupsFile.createNewFile();
+        Map<String, List<TeamEnderChestBackup>> snapshot = new LinkedHashMap<>();
+        synchronized (backupsLock) {
+            backups.forEach((key, value) -> snapshot.put(key, new ArrayList<>(value)));
+        }
+
+        synchronized (saveLock) {
+            Path temporaryPath = backupsPath.resolveSibling(backupsPath.getFileName() + ".tmp");
+            try {
+                Files.createDirectories(backupsPath.getParent());
+                Files.writeString(
+                        temporaryPath,
+                        gson.toJson(snapshot),
+                        StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE
+                );
+
+                try {
+                    Files.move(temporaryPath, backupsPath,
+                            StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException exception) {
+                    Files.move(temporaryPath, backupsPath, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (IOException exception) {
+                plugin.getLogger().log(Level.SEVERE, "Failed to save ender chest backups.", exception);
+                try {
+                    Files.deleteIfExists(temporaryPath);
+                } catch (IOException cleanupException) {
+                    plugin.getLogger().log(Level.WARNING, "Could not remove the temporary ender chest backup file.", cleanupException);
+                }
             }
-            
-            try (FileWriter writer = new FileWriter(backupsFile)) {
-                gson.toJson(backups, writer);
-            }
-        } catch (IOException e) {
-            plugin.getLogger().log(java.util.logging.Level.SEVERE, 
-                "Failed to save ender chest backups: {0}", e.getMessage());
         }
     }
 }
